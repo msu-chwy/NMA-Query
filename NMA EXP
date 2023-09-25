@@ -1,0 +1,314 @@
+----------------------------------------------------------------------------------
+-- getting native event data first
+--ios only
+----------------------------------------------------------------------------------
+create or replace table ecom_sandbox.NMA_DARK_MODE_2 as
+select
+    nma_linker_id,
+    convert_timezone('UTC', 'America/New_York', session_start_timestamp)::date as session_date,
+    session_id nma_session_id,
+    null hybrid_session_id,
+    case when dataset ilike '%android%' then 'android' else 'ios' end as dataset,
+    event_timestamp,
+    event_id,
+    event_name,
+    properties:event_category::string as event_category,
+    properties:event_action::string as event_action,
+    event_label,
+    properties,
+    null as order_id,
+    null as revenue_amount,
+    null as transaction_units,
+    screen_name,
+    case 
+        when session_traits:experiments:darkmodedisablement_enabled::string = 'on' then 'Treatment' 
+        when session_traits:experiments:darkmodedisablement_enabled::string = 'off' then 'Control' 
+       end as Variation,
+    properties:page_type::string as page_type
+from
+    segment.SEGMENT_NMA_HITS a
+where
+    --dataset in ('ios') and 
+    session_date = '2023-08-04'
+    and not (event_name in ('Order Completed', 'Checkout Started')) -- to not conflict with hybrid events
+    and session_traits:experiments:darkmodedisablement_enabled::string in ('on', 'off')
+
+union all
+
+----------------------------------------------------------------------------------
+-- getting hybrid event data
+----------------------------------------------------------------------------------
+select
+    properties:nma_linker_id::string as nma_linker_id,
+    convert_timezone('UTC', 'America/New_York', session_start_timestamp)::date as session_date,
+    null as nma_session_id,
+    session_id as hybrid_session_id,
+    case when dataset ilike '%android%' then 'android' else 'ios' end as dataset,
+    event_timestamp,
+    event_id,
+    event_name,
+    event_category,
+    event_action,
+    event_label,
+    properties,
+    order_id,
+    null revenue_amount,
+    null transaction_units,
+    properties:screen_name::string as screen_name,
+    Variation,
+    properties:page_type::string as page_type
+FROM
+    segment.SEGMENT_HITS_HYBRID a
+INNER JOIN 
+    (select distinct nma_linker_id, 
+        case 
+        when session_traits:experiments:darkmodedisablement_enabled::string = 'on' then 'Treatment' 
+        when session_traits:experiments:darkmodedisablement_enabled::string = 'off' then 'Control' 
+       end as Variation
+        from segment.segment_nma_hits
+        --where dataset in ('ios') 
+        where convert_timezone('UTC', 'America/New_York', session_start_timestamp)::date = '2023-08-04'
+        and session_traits:experiments:darkmodedisablement_enabled::string in ('on', 'off')
+        and session_id IS NOT NULL
+        ) b
+ON a.properties:nma_linker_id::string = b.nma_linker_id
+WHERE
+    session_date = '2023-08-04'
+    and (
+          (event_category = 'eec' and event_action = 'checkout' and event_label='checkout') or
+          (event_action = 'purchase' and order_id is not null) 
+      )
+;
+
+select * from ecom_sandbox.NMA_DARK_MODE_2 limit 100;
+----------------------------------------------------------------------------------
+-- fill in session id and other metrics
+-- Do not use on 9_23_23
+----------------------------------------------------------------------------------
+
+CREATE OR REPLACE TABLE ecom_sandbox.NMA_Dark_Mode_SESSIONS_SESSION_PRE AS
+with tmp as (
+    select
+        coalesce(
+                lag(nma_session_id, 1) ignore nulls over(partition by nma_linker_id order by event_timestamp),
+                nma_session_id,
+                hybrid_session_id
+            ) as derived_session_id
+         ,*
+    from
+        ecom_sandbox.NMA_DARK_MODE_2
+    where nma_linker_id is not null
+    order by
+        event_timestamp
+)
+
+select distinct
+    first_value(nma_linker_id) ignore nulls over(partition by derived_session_id order by event_timestamp)  as nma_linker_id,
+    session_date,
+    nma_session_id,
+    derived_session_id session_id,
+    first_value(dataset) ignore nulls over(partition by derived_session_id order by event_timestamp) as dataset,
+    event_timestamp,
+    event_id,
+    event_name,
+    event_category,
+    event_action,
+    event_label,
+    properties,
+    order_id,
+    revenue_amount,
+    transaction_units,
+    screen_name,
+    first_value(VARIATION) ignore nulls over(partition by derived_session_id order by event_timestamp) as VARIATION,
+    page_type
+from
+    tmp;
+select * from ecom_sandbox.NMA_Dark_Mode_SESSIONS_SESSION_PRE limit 100;
+
+select * from ecom_sandbox.NMA_Dark_Mode_SESSIONS_SESSION_PRE where variation is null;
+
+----------------------------------------------------------------------------------
+----------------Orders Data
+----------------------------------------------------------------------------------
+create or replace table ecom_sandbox.tmp_segment_dark_mode_sessions_orders as (
+    with t1 as (
+        select distinct
+            session_id, ORDER_PLACED_DTTM,
+            ol.order_id as order_id
+        from
+            ecom_sandbox.NMA_Dark_Mode_SESSIONS_SESSION_PRE a 
+        inner join ecom.order_line ol on a.order_id = ol.order_id
+        where a.order_id is not null
+    )
+
+       ,t3 as (
+        select o.order_id as be_order_id, 
+               sum(olm.ORDER_LINE_QUANTITY) as NMA_Units,
+               sum(olm.order_line_total_price) Total_Revenue
+        from
+            ecom.orders o
+                inner join
+            ecom.order_line olm on o.order_id = olm.order_id
+        group by 1
+    )
+
+       ,t4 as(
+        select distinct
+            t1.*,
+            t3.*
+        FROM
+            t1
+                left join
+            t3 on t1.order_id = t3.be_order_id
+    )
+
+    select
+        session_id as order_session_id, ORDER_PLACED_DTTM,
+        sum(
+                CASE
+                    WHEN order_id IS NOT NULL
+                        THEN NMA_Units
+                    END)order_units,
+        SUM(
+                CASE
+                    WHEN order_id IS NOT NULL
+                        THEN Total_Revenue
+                    ELSE 0
+                    END) AS order_total_sales
+    from
+        t4
+    group by
+        1,2
+);
+
+select * from ecom_sandbox.tmp_segment_dark_mode_sessions_orders limit 100;
+//Paused here
+----------------------------------------------------------------------------------
+----------------Activation point
+-----------------Do not need activation point for 9/25/23 run
+----------------------------------------------------------------------------------
+-- get the activation hit and time
+/*
+create
+    or replace local temp table activation_sessions as
+select
+    *
+from
+    (
+        select
+            case 
+                when session_traits:experiments:pdp_wordcloud_enabled::string = 'on' then 'Treatment' 
+                when session_traits:experiments:pdp_wordcloud_enabled::string = 'off' then 'Control' 
+            end as Variation,
+            nma_linker_id,
+            session_id,
+            event_timestamp,
+            row_number() over(
+                partition by session_id
+                order by
+                    event_timestamp
+            ) as rank
+        from
+            segment.segment_nma_hits
+        where
+            (event_name = 'Button Clicked'
+            AND event_label = 'show more reviews')
+            AND session_traits:experiments:pdp_wordcloud_enabled::string in ('on','off')
+            AND convert_timezone('UTC', 'America/New_York', session_start_timestamp)::date between '2023-08-04' and '2023-08-21'
+            AND dataset in ('ios')
+            and session_id IS NOT NULL
+    )
+where
+    rank = 1;
+    
+-- this is to get all events after activation 
+create
+    or replace local temp table sessions as
+select
+    a.*,
+    b.event_timestamp as activation_time
+from
+    ecom_sandbox.NMA_WC_SESSIONS_PRE as a
+    inner join activation_sessions as b on a.session_id = b.session_id
+    and timediff(
+        millisecond,
+        a.event_timestamp,
+        b.event_timestamp
+    ) < 1000;
+    
+-- aggregate on the sessions level    
+create
+    or replace local temp table ecom_sandbox.nma_wc_sessions_zs as
+select 
+a.*,
+    COALESCE(b.order_units, 0) AS order_units,
+    COALESCE(b.order_total_sales, 0) AS order_total_sales
+from sessions a
+left join ecom_sandbox.tmp_segment_sessions_orders b
+on a.session_id = b.order_session_id;
+
+
+CREATE OR REPLACE TABLE ecom_sandbox.NMA_WC_SESSIONS_ios_ZS AS
+SELECT * FROM ecom_sandbox.nma_wc_sessions_zs;
+
+commit;
+
+*/
+
+-- aggregate on the sessions level    
+create
+    or replace local temp table ecom_sandbox.nma_dark_mode_sessions_test as
+select 
+a.*,
+    COALESCE(b.order_units, 0) AS order_units,
+    COALESCE(b.order_total_sales, 0) AS order_total_sales
+from ecom_sandbox.NMA_Dark_Mode_SESSIONS_SESSION_PRE a
+left join ecom_sandbox.tmp_segment_dark_mode_sessions_orders b
+on a.session_id = b.order_session_id;
+
+
+select * from ecom_sandbox.nma_DARK_MODE_sessions_ZS where order_id is not null limit 10;
+----------------------------------------------------------------------------------
+-- Build Aggregation Table
+----------------------------------------------------------------------------------
+
+CREATE OR REPLACE TABLE ECOM_SANDBOX.TMP_SEGMENT_DARK_MODE_SESSIONS AS 
+SELECT
+  VARIATION
+, DATASET
+, COUNT(DISTINCT NMA_SESSION_ID) AS TOTAL_SESSIONS
+, COUNT(DISTINCT NMA_LINKER_ID) AS TOTAL_VISITORS
+, COUNT(DISTINCT
+    CASE
+    WHEN EVENT_ACTION in ('purchase')
+    AND order_id IS NOT NULL
+    THEN ORDER_ID
+    END) AS ORDERS
+, SUM(CASE WHEN EVENT_ACTION in ('purchase') AND order_id IS NOT NULL THEN order_total_sales END) AS TRANSACTION_REVENUE 
+--PDP Metrics
+--, COUNT(DISTINCT CASE WHEN event_name = 'Product Viewed' THEN SESSION_ID END) AS PDP_SESSIONS
+, COUNT(DISTINCT
+          CASE
+              WHEN event_name = 'Product Added'
+                  AND (not coalesce(event_label, '') ilike '%addtoautoship%')
+                  and (not coalesce(event_action, '') ilike '%addtoautoship%')
+                  THEN session_id
+              ELSE NULL
+           END)    atc_sessions
+,COUNT(DISTINCT
+          CASE
+              WHEN event_name = 'Product Added'
+                  AND (
+                        ( coalesce(event_label, '') ilike '%addtoautoship%') 
+                  OR    
+                        ( coalesce(event_action, '') ilike '%addtoautoship%') 
+                      )
+                  THEN session_id
+              ELSE NULL
+           END)    ata_sessions
+FROM ecom_sandbox.nma_DARK_MODE_sessions_test
+GROUP BY 1,2
+ORDER BY 1,2 asc
+;
+
+SELECT * FROM  ECOM_SANDBOX.TMP_SEGMENT_DARK_MODE_SESSIONS;
