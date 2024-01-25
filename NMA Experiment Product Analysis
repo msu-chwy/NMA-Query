@@ -1,0 +1,965 @@
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- SQL Query for NMA Experiment Product Analysis
+-- -------------------------------------
+-- Purpose:
+--   This script is intended for the analysis of NMA experiments.
+--   It includes product-specific data and merchandising class breakdowns by utilizing data from 'segment.SEGMENT_NMA_HITS_PRODUCTS' and 'segment.SEGMENT_HITS_PRODUCTS_HYBRID'.
+--   For analyses that do not require product-specific information, please use the 'NMA Experiment Analysis'.
+
+-- Customization Instructions:
+--   To tailor this analysis to your experiment, you must update the following:
+--   1. Experiment Date: Amend the date on line 25 to match your experiment timeline.
+--   2. Experiment Name: Change the experiment identifier on lines 35-36, 77, 127-128, and 133.
+--   3. Activation Point: Update the activation point of your experiment on line 446.
+
+-- Output Description:
+--   After running this script, you will obtain:
+--   1. Metric Aggregation: The 'ecom_sandbox.tmp_sat_nma_exp_product_nma_metric_aggregate' table will include standard NMA metrics in PAWs.
+--   2. Events Table: The 'ecom_sandbox.tmp_sat_nma_exp_product_sessions_custom_table' will be populated for ad-hoc analyses.
+--   3. Custom Metrics: You can extend the 'ecom_sandbox.tmp_sat_nma_exp_product_sessions_custom_table' with additional custom metrics.
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Your SQL query will start below this line
+-- Set start_date and end_date of the experiment
+set (start_date, end_date)  = ('2023-06-30', '2023-07-01');
+
+----------------------------------------------------------------------------------
+-- getting native event data first
+-- update experiment name in row#35-36 and #77
+----------------------------------------------------------------------------------
+
+create or replace local temp table ecom_sandbox.tmp_sat_nma_exp_product_sessions_events as
+select
+    case
+        when session_traits:experiments:pdp_wordcloud_enabled::string = 'on' then 'VARIANT' 
+        when session_traits:experiments:pdp_wordcloud_enabled::string = 'off' then 'CONTROL' 
+    end as variation,
+    coalesce(nma_linker_id, hit_traits:nma_linker_id::string) as nma_linker_id,
+    convert_timezone('UTC', 'America/New_York', session_start_timestamp)::date as session_date,
+    session_id as nma_session_id,
+    null as hybrid_session_id,
+    customer_id,
+    'Segment' as data_provider,
+    dataset,
+    dataset as device_category,
+    new_customer_flag,
+    active_autoship_derived as active_autoship_flag,
+    tried_autoship_derived as tried_autoship_flag,
+    channel_grouping_last_non_direct as channel_grouping,
+    channel_grouping_last_non_direct as channel,
+    authentication_state,
+    event_timestamp,
+    event_id,
+    event_name,
+    event_category,
+    properties:event_action::string as event_action,
+    event_label,
+    properties,
+    properties:screen_name::string as screen_name,
+    properties:page_type::string as page_type,
+    null as order_id,
+    null as revenue_amount,
+    null as transaction_units,
+    utm_parameter_derived_last_non_direct:utm_source::string as source,
+    utm_parameter_derived_last_non_direct:utm_medium::string as medium,
+    utm_parameter_derived_last_non_direct:utm_campaign::string as campaign,
+    MERCH_CLASSIFICATION1,
+    MERCH_CLASSIFICATION2
+from
+    segment.segment_nma_hits_products s
+left join 
+    pdm.product p on s.product_sku = p.part_number
+where
+  session_start_timestamp::date between $start_date and $end_date
+  and dataset in ('android', 'ios')
+  and (event_name is null or event_name not in ('Order Completed', 'Checkout Started'))
+  and session_traits:experiments:pdp_wordcloud_enabled::string in ('on', 'off')
+
+union all
+
+----------------------------------------------------------------------------------
+-- getting hybrid event data
+-- update experiment name in row#127-128, row#133
+----------------------------------------------------------------------------------
+
+select
+    b.variation,
+    a.properties:nma_linker_id::string as nma_linker_id,
+    a.session_start_timestamp::date as session_date,
+    null as nma_session_id,
+    a.session_id as hybrid_session_id,
+    null as customer_id,
+    'Segment' as data_provider,
+    case when a.dataset ilike '%android%' then 'android' else 'ios' end as dataset,
+    case when a.dataset ilike '%android%' then 'android' else 'ios' end as device_category,
+    null as new_customer_flag,
+    null as active_autoship_flag,
+    null as tried_autoship_flag,
+    null as channel_grouping,
+    null as channel,
+    a.properties:authentication_state::string as authentication_state,
+    a.event_timestamp,
+    a.event_id,
+    a.event_name,
+    a.event_category,
+    a.event_action,
+    a.event_label,
+    a.properties,
+    a.properties:screen_name::string as screen_name,
+    a.properties:page_type::string as page_type,
+    a.order_id,
+    null as revenue_amount,
+    null as transaction_units,
+    null as source,
+    null as medium,
+    null as campaign,
+    MERCH_CLASSIFICATION1,
+    MERCH_CLASSIFICATION2
+FROM
+    segment.SEGMENT_HITS_PRODUCTS_HYBRID as a
+LEFT JOIN
+    pdm.product p
+ON a.product_sku = p.part_number
+INNER JOIN 
+    (select distinct nma_linker_id, 
+        case 
+            when session_traits:experiments:pdp_wordcloud_enabled::string = 'on' then 'VARIANT' 
+            when session_traits:experiments:pdp_wordcloud_enabled::string = 'off' then 'CONTROL' 
+        end as variation
+        from segment.segment_nma_hits
+        where dataset in ('ios','android') 
+        and convert_timezone('UTC', 'America/New_York', session_start_timestamp)::date between $start_date and $end_date
+        and session_traits:experiments:pdp_wordcloud_enabled::string in ('on', 'off')
+        and session_id IS NOT NULL
+    ) as b
+ON a.properties:nma_linker_id::string = b.nma_linker_id
+WHERE
+    a.session_start_timestamp::date between $start_date and $end_date
+  and (
+        (a.event_category = 'checkout' and a.event_action = 'customer-state') or
+        (a.event_action = 'purchase' and a.order_id is not null)
+    )
+;
+
+
+----------------------------------------------------------------------------------
+-- fill in session id and other metrics
+----------------------------------------------------------------------------------
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events AS
+with tmp as (
+    select
+        coalesce(
+                lag(nma_session_id, 1) ignore nulls over(partition by nma_linker_id order by event_timestamp),
+                nma_session_id,
+                hybrid_session_id
+            ) as derived_session_id
+         ,*
+    from
+        ecom_sandbox.tmp_sat_nma_exp_product_sessions_events
+    where nma_linker_id is not null
+    order by
+        event_timestamp
+)
+select distinct
+    first_value(variation) ignore nulls over(partition by derived_session_id order by event_timestamp)  as variation,
+    first_value(nma_linker_id) ignore nulls over(partition by derived_session_id order by event_timestamp)  as nma_linker_id,
+    session_date,
+    -- session_id,
+    derived_session_id,
+    first_value(customer_id) ignore nulls over(partition by derived_session_id order by event_timestamp) as customer_id,
+    data_provider,
+    first_value(dataset) ignore nulls over(partition by derived_session_id order by event_timestamp) as dataset ,
+    first_value(device_category) ignore nulls over(partition by derived_session_id order by event_timestamp) as device_category,
+    first_value(new_customer_flag) ignore nulls over(partition by derived_session_id order by event_timestamp)  as new_customer_flag,
+    first_value(active_autoship_flag) ignore nulls over(partition by derived_session_id order by event_timestamp) as active_autoship_flag,
+    first_value(tried_autoship_flag) ignore nulls over(partition by derived_session_id order by event_timestamp) as tried_autoship_flag,
+    first_value(channel_grouping) ignore nulls over(partition by derived_session_id order by event_timestamp) as channel_grouping,
+    first_value(channel) ignore nulls over(partition by derived_session_id order by event_timestamp) as channel,
+    authentication_state,
+    event_timestamp,
+    event_id,
+    event_name,
+    event_category,
+    event_action,
+    event_label,
+    properties,
+    screen_name,
+    page_type,
+    order_id,
+    revenue_amount,
+    transaction_units,
+    first_value(source) ignore nulls over (partition by derived_session_id order by event_timestamp) as source,
+    first_value(medium) ignore nulls over (partition by derived_session_id order by event_timestamp) as medium,
+    first_value(campaign) ignore nulls over (partition by derived_session_id order by event_timestamp) as campaign,
+    min(event_timestamp) over (partition by derived_session_id) session_start_dttm,
+    max(event_timestamp) over (partition by derived_session_id) session_end_dttm,
+    timestampdiff(second,session_start_dttm,session_end_dttm ) session_duration,
+    MERCH_CLASSIFICATION1,
+    MERCH_CLASSIFICATION2
+from
+    tmp;
+
+
+create or replace local temp table ecom_sandbox.tmp_sat_nma_exp_product_sessions_orders as (
+    with t1 as (
+        select distinct
+            a.derived_session_id,
+            a.order_id as order_id,
+            ORDER_PLACED_DTTM
+        from
+            ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events a
+        inner join ecom.order_line ol on a.order_id = ol.order_id
+        where
+            a.order_id is not null
+    )
+
+       ,t3 as (
+        select o.order_id as be_order_id, sum(olm.ORDER_LINE_QUANTITY) as NMA_Units,
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = false
+                           AND o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = false
+                           THEN olm.order_line_total_price
+                       ELSE NULL
+                   END) AS ship_now_Revenue,
+
+               sum( olm.order_line_total_price) Total_Revenue,
+
+               (Total_Revenue-ifnull(ship_now_revenue,0)) Merch_Sales,
+               max(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           THEN true
+                       ELSE false
+                   END) first_order_flag,
+
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           THEN olm.ORDER_LINE_QUANTITY
+                       ELSE 0
+                   END) first_order_units,
+
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           THEN olm.order_line_total_price
+                       ELSE 0
+                   END) first_order_total_revenue,
+
+               first_order_total_revenue - ship_now_Revenue first_order_merch_sales,
+
+               max(CASE
+                       WHEN o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN true
+                       ELSE false
+                   END) autoship_order_flag,
+
+               sum(CASE
+                       WHEN o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN olm.ORDER_LINE_QUANTITY
+                       ELSE 0
+                   END) autoship_order_units,
+
+               sum(CASE
+                       WHEN o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN olm.order_line_total_price
+                       ELSE 0
+                   END) autoship_order_total_revenue,
+
+               autoship_order_total_revenue - ship_now_Revenue autoship_order_merch_sales,
+
+               max(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           AND o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN true
+                       ELSE false
+                   END) first_order_autoship_flag,
+
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           AND o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN olm.ORDER_LINE_QUANTITY
+                       ELSE 0
+                   END) first_order_autoship_units,
+
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           AND o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN olm.order_line_total_price
+                       ELSE 0
+                   END) first_order_autoship_total_revenue,
+
+               first_order_autoship_total_revenue - ship_now_Revenue first_order_autoship_merch_sales
+
+        from
+            ecom.orders o
+                inner join
+            ecom.order_line olm on o.order_id = olm.order_id
+        group by 1
+    )
+
+       ,t4 as(
+        select distinct
+            t1.*,
+            t3.*
+        FROM
+            t1
+                left join
+            t3 on t1.order_id = t3.be_order_id
+    )
+
+    select
+        derived_session_id as order_session_id,
+        ORDER_PLACED_DTTM,
+        sum(
+                CASE
+                    WHEN order_id IS NOT NULL
+                        THEN NMA_Units
+                    END)order_units,
+        SUM(
+                CASE
+                    WHEN order_id IS NOT NULL
+                        THEN Total_Revenue
+                    ELSE 0
+                    END) AS order_total_sales,
+
+        SUM(
+                CASE
+                    WHEN order_id IS NOT NULL
+                        THEN Merch_Sales
+                    ELSE 0
+                    END) AS order_merch_sales,
+
+        COUNT(DISTINCT
+              CASE
+                  WHEN first_order_flag = true
+                      THEN order_id
+                  END) AS first_orders,
+
+        SUM(CASE
+                WHEN first_order_flag = true
+                    AND order_id IS NOT NULL
+                    THEN first_order_units
+                ELSE 0
+            END) AS first_order_units,
+
+        SUM(CASE
+                WHEN first_order_flag = true
+                    AND order_id IS NOT NULL
+                    THEN first_order_total_revenue
+            END) AS first_order_total_sales,
+        SUM(first_order_merch_sales) AS first_order_merch_sales,
+
+        COUNT(DISTINCT
+              CASE
+                  WHEN autoship_order_flag = true
+                      THEN order_id
+                  END) AS autoship_orders,
+
+        SUM(CASE
+                WHEN autoship_order_flag = true
+                    AND order_id IS NOT NULL
+                    THEN autoship_order_units
+            END) AS autoship_order_units,
+
+        SUM(
+                CASE
+                    WHEN autoship_order_flag = true
+                        then autoship_order_total_revenue
+                    ELSE 0
+                    END) as autoship_order_total_sales,
+
+        SUM(
+                CASE
+                    WHEN autoship_order_flag = true
+                        AND order_id IS NOT NULL
+                        THEN AUTOSHIP_ORDER_MERCH_SALES
+                    ELSE 0
+                    END) as autoship_order_merch_sales,
+
+        COUNT(DISTINCT
+              CASE
+                  WHEN FIRST_ORDER_AUTOSHIP_FLAG = true
+                      and order_id IS NOT NULL
+                      THEN order_id
+                  ELSE NULL
+                  END) AS first_order_autoships,
+
+        SUM(
+                CASE
+                    WHEN first_order_autoship_flag = true
+                        AND order_id IS NOT NULL
+                        THEN FIRST_ORDER_AUTOSHIP_UNITS
+                    ELSE 0
+                    END) AS first_order_autoship_units,
+
+        SUM(
+                CASE  when first_order_autoship_flag = true
+                    AND order_id IS NOT NULL
+                          then FIRST_ORDER_AUTOSHIP_TOTAL_REVENUE
+                      ELSE 0
+                    END) AS first_order_autoship_total_sales,
+
+        SUM(
+                CASE
+                    WHEN first_order_autoship_flag = true
+                        AND order_id IS NOT NULL
+                        THEN FIRST_ORDER_AUTOSHIP_MERCH_SALES
+                    ELSE 0
+                    END) AS first_order_autoship_merch_sales
+    from
+        t4
+    group by
+        1,2
+);
+
+
+----------------------------------------------------------------------------------
+----------------Activation point
+----------------------------------------------------------------------------------
+-- get the activation hit and time
+-- Update row#446 to the activation point of the experiment
+create
+    or replace local temp table activation_sessions as
+select
+    *
+from
+    (
+        select
+            Variation,
+            nma_linker_id,
+            derived_session_id,
+            event_timestamp,
+            row_number() over(
+                partition by derived_session_id
+                order by
+                    event_timestamp
+            ) as rank
+        from
+            ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events
+        where
+            event_name = 'Product Viewed' --activation point of experiments
+    )
+where
+    rank = 1;
+    
+-- this is to get all events after activation 
+create
+    or replace local temp table ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events_final as
+select
+    a.*,
+    b.event_timestamp as activation_time
+from
+    ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events as a
+    inner join activation_sessions as b on a.derived_session_id = b.derived_session_id
+    and timediff(
+        millisecond,
+        a.event_timestamp,
+        b.event_timestamp
+    ) < 1000;
+
+-- Orders that placed after activation
+CREATE OR REPLACE TEMP TABLE ecom_sandbox.tmp_sat_nma_exp_product_sessions_orders_final AS
+WITH MinEventTimes AS (
+    SELECT derived_session_id, MIN(event_timestamp) as MinEventTimestamp
+    FROM ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events_final
+    GROUP BY derived_session_id
+)
+SELECT b.*
+FROM ecom_sandbox.tmp_sat_nma_exp_product_sessions_orders b
+INNER JOIN MinEventTimes met
+ON b.order_session_id = met.derived_session_id
+WHERE b.ORDER_PLACED_DTTM > met.MinEventTimestamp;
+
+
+----------------------------------------------------------------------------------
+---------------- Tables to be used for custom analysis
+----------------------------------------------------------------------------------
+CREATE OR REPLACE TEMP TABLE ecom_sandbox.tmp_sat_nma_exp_product_sessions_custom_table AS
+select a. derived_session_id as session_id, 
+       a.*,
+       b.*
+from
+    ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events_final a
+        left join
+    ecom_sandbox.tmp_sat_nma_exp_product_sessions_orders_final b 
+on a.derived_session_id = b.order_session_id;
+
+----------------------------------------------------------------------------------
+---------------- Build aggregate table for standard metrics in PAWs
+----------------------------------------------------------------------------------
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sat_nma_exp_product_sessions_events_aggregate AS
+SELECT
+    variation,
+    nma_linker_id,
+    SESSION_DATE,
+    se.derived_session_id,
+    data_provider,
+    dataset,
+    device_category,
+    se.customer_id,
+    null personalization_id,
+    null customer_session_id,
+    session_start_dttm,
+    session_end_dttm,
+    session_duration,
+    channel_grouping,
+    channel,
+    source,
+    medium,
+    campaign,
+    MERCH_CLASSIFICATION1,
+    MERCH_CLASSIFICATION2,
+    null referer,
+    new_customer_flag,
+    active_autoship_flag,
+    tried_autoship_flag,
+    NULL AS home_page_hits,
+    NULL AS plp_hits,
+    max(
+            CASE
+                WHEN authentication_state IN ('fully-authenticated','authenticated')
+                    THEN true else false
+                END)  AS derived_login_session_flag,
+    COUNT(DISTINCT
+          CASE
+              WHEN event_name = 'Product Viewed'
+                  THEN event_id
+              ELSE NULL
+              END) pdp_hits,
+    COUNT(DISTINCT
+          CASE
+              WHEN event_name = 'Product Added'
+                  AND (not coalesce(properties:event_label::string, '') ilike '%addtoautoship%')
+                  and (not coalesce(properties:event_action::string, '') ilike '%addtoautoship%')
+                  THEN event_id
+              ELSE NULL
+              END)    atc_hits,
+        COUNT(DISTINCT
+          CASE
+              WHEN event_name = 'Product Added'
+                  AND ((coalesce(properties:event_label::string, '') ilike '%addtoautoship%')
+                  or (coalesce(properties:event_action::string, '') ilike '%addtoautoship%'))
+                  THEN event_id
+              ELSE NULL
+              END)    ata_hits,
+    COUNT(DISTINCT
+          CASE
+              WHEN event_category = 'checkout' and event_action = 'customer-state'
+                  THEN event_id
+              ELSE NULL
+              END) checkout_hits,
+    COUNT(DISTINCT
+          CASE
+              WHEN event_action in ('purchase')
+                  AND se.order_id IS NOT NULL
+                  THEN event_id
+              END)    purchase_hits,
+    NULL AS search_hits,
+    NULL AS browse_hits,
+    COUNT(DISTINCT
+          CASE
+              WHEN event_action in ('purchase')
+                  AND se.order_id IS NOT NULL
+                  THEN se.order_id
+              END) orders
+
+FROM
+    ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events_final se
+GROUP BY
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------
+create or replace local temp table ecom_sandbox.tmp_sat_nma_exp_product_session_event_aggregate_v2 as
+select
+    a.*,
+    b.*
+from
+    ecom_sandbox.tmp_sat_nma_exp_product_sessions_events_aggregate a
+        left join
+    ecom_sandbox.tmp_sat_nma_exp_product_sessions_orders_final b on a.derived_session_id = b.order_session_id;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sat_nma_exp_product_success_hits_src_v1 AS
+SELECT
+    *
+FROM
+    (
+        SELECT DISTINCT
+            'plp_success_hits' success_hits,
+            derived_session_id,
+            0 match_number
+        FROM
+            ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events_final)
+UNION ALL
+SELECT
+    *
+FROM
+    (WITH pdp_success_hits AS (
+        SELECT
+            *
+        FROM
+            ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events_final
+        WHERE
+                event_name = 'Product Viewed'
+           or (
+                    event_name = 'Product Added'
+                AND (properties:event_label is null or (properties:event_label is not null and properties:event_label not ilike '%addtoautoship%'))
+                AND (coalesce(properties:event_action::string, '') not ilike '%addtoautoship%')
+            )
+    )
+     SELECT
+         'pdp_success_hits' success_hits,
+         derived_session_id,
+         match_number
+     FROM
+         pdp_success_hits match_recognize( partition BY derived_session_id ORDER BY
+        event_timestamp measures match_number() AS match_number one row per MATCH pattern
+        (pdp_hit atc_hit) define pdp_hit        AS event_name in ('Product Viewed'),
+                                           atc_hit  AS event_name = 'Product Added'
+        AND (properties:event_label is null or (properties:event_label is not null and properties:event_label not ilike '%addtoautoship%'))
+        AND (coalesce(properties:event_action::string, '') not ilike '%addtoautoship%')
+             )
+     ORDER BY
+         match_number )
+UNION ALL
+
+SELECT
+    *
+FROM
+    (
+        WITH
+            atc_success_hits AS
+                (
+                    SELECT
+                        *
+                    FROM
+                        ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events_final
+                    WHERE
+                        (event_name = 'Product Added'
+                            AND (properties:event_label is null or (properties:event_label is not null and properties:event_label not ilike '%addtoautoship%'))
+                            AND (coalesce(properties:event_action::string, '') not ilike '%addtoautoship%')
+                            ) 	or (event_category = 'checkout' and event_action = 'customer-state')
+                )
+        SELECT
+            'atc_success_hits' success_hits,
+            derived_session_id,
+            match_number
+        FROM
+            atc_success_hits match_recognize( partition BY derived_session_id ORDER BY
+        event_timestamp measures match_number() AS match_number one row per MATCH pattern
+        (atc_hit checkout_hit) define atc_hit   AS event_name = 'Product Added'
+        AND (properties:event_label is null or (properties:event_label is not null and properties:event_label not ilike '%addtoautoship%'))
+        AND (coalesce(properties:event_action::string, '') not ilike '%addtoautoship%'),
+                                              checkout_hit AS event_category = 'checkout' and event_action = 'customer-state' )
+        ORDER BY
+            match_number )
+UNION ALL
+SELECT
+    *
+FROM
+    (
+        WITH
+            checkout_success_hits AS
+                (
+                    SELECT
+                        *
+                    FROM
+                        ecom_sandbox.tmp_sat_nma_exp_product_total_sessions_events_final
+                    WHERE
+                        (event_category = 'checkout' and event_action = 'customer-state' )
+                       or (event_action = 'purchase' and order_id is not null)
+                )
+        SELECT
+            'checkout_success_hits' success_hits,
+            derived_session_id,
+            match_number
+        FROM
+            checkout_success_hits match_recognize( partition BY derived_session_id ORDER BY
+        event_timestamp measures match_number()        AS match_number one row per MATCH pattern
+        (checkout_hit purchase_hit) define checkout_hit AS event_category = 'checkout' and event_action = 'customer-state',
+                                                   purchase_hit AS event_action = 'purchase' and order_id is not null )
+        ORDER BY
+            match_number ) ;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sat_nma_exp_product_success_hits_aggregate_v1 AS
+WITH
+    t1 AS (
+        SELECT
+            derived_session_id,
+            success_hits,
+            MAX(match_number) match_number
+        FROM
+            ecom_sandbox.tmp_sat_nma_exp_product_success_hits_src_v1
+        GROUP BY 1,2
+    )
+SELECT
+    derived_session_id,
+    SUM(
+            CASE
+                WHEN success_hits = 'plp_success_hits'
+                    THEN match_number
+                ELSE 0
+                END ) plp_success_hits,
+    SUM(
+            CASE
+                WHEN success_hits = 'pdp_success_hits'
+                    THEN match_number
+                ELSE 0
+                END ) pdp_success_hits,
+    SUM(
+            CASE
+                WHEN success_hits = 'atc_success_hits'
+                    THEN match_number
+                ELSE 0
+                END) atc_success_hits,
+    SUM(
+            CASE
+                WHEN success_hits = 'checkout_success_hits'
+                    THEN match_number
+                ELSE 0
+                END) checkout_success_hits
+FROM
+    t1
+GROUP BY
+    1 ;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sat_nma_exp_product_success_hits_final_v1 AS
+SELECT
+    derived_session_id ,
+    plp_success_hits,
+    pdp_success_hits,
+    atc_success_hits,
+    checkout_success_hits,
+    CASE
+        WHEN plp_success_hits > 0
+            THEN true
+        ELSE false
+        END plp_success_session,
+    CASE
+        WHEN pdp_success_hits > 0
+            THEN true
+        ELSE false
+        END pdp_success_session,
+    CASE
+        WHEN atc_success_hits > 0
+            THEN true
+        ELSE false
+        END atc_success_session,
+    CASE
+        WHEN checkout_success_hits > 0
+            THEN true
+        ELSE false
+        END checkout_success_session
+FROM
+    ecom_sandbox.tmp_sat_nma_exp_product_success_hits_aggregate_v1;
+
+-------------------------------------------------------------------------------------------------------------------------------------
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sat_nma_exp_product_nma_session_aggregate_v1 AS
+SELECT
+    variation,
+    gh.session_date,
+    data_provider,
+    gh.dataset,
+    gh.derived_session_id as session_id,
+    gh.customer_id,
+    gh.personalization_id,
+    gh.customer_session_id,
+    COALESCE(new_customer_flag, true) as new_customer_flag,
+    COALESCE(active_autoship_flag, false) as active_autoship_flag,
+    COALESCE(tried_autoship_flag, false) as tried_autoship_flag,
+    (case when gh.customer_id is not null or gh.customer_id <> 0 then true else false end) recognized_session_flag,
+    derived_login_session_flag login_session_flag,
+    device_category,
+    channel_grouping,
+    channel,
+    source,
+    medium,
+    campaign,
+    MERCH_CLASSIFICATION1,
+    MERCH_CLASSIFICATION2,
+    referer,
+    session_start_dttm,
+    session_end_dttm,
+    session_duration,
+    NULL session_start_page,
+    NULL session_start_page_type,
+    NULL session_last_page,
+    NULL session_last_page_type,
+    NULL bounce_session,
+    NULL plp_session_flag,
+    case when pdp_hits > 0 then true else false end pdp_session_flag,
+    case when atc_hits > 0 then true else false end atc_session_flag,
+    case when ata_hits > 0 then true else false end ata_session_flag,
+    case when checkout_hits > 0 then true else false end checkout_session_flag,
+    case when purchase_hits > 0 then true else false end purchase_session_flag,
+    0 home_page_hits,
+    0 page_hits,
+    0 plp_hits,
+    COALESCE(pdp_hits,0) pdp_hits,
+    0 as oos_pdp_hits,
+    COALESCE(atc_hits,0) atc_hits,
+    COALESCE(checkout_hits,0) checkout_hits,
+    COALESCE(purchase_hits,0) purchase_hits,
+    COALESCE(search_hits,0) search_hits,
+    COALESCE(browse_hits,0) browse_hits,
+    COALESCE(sh.plp_success_hits,0) plp_success_hits,
+    COALESCE(sh.pdp_success_hits,0) pdp_success_hits,
+    COALESCE(sh.atc_success_hits,0) atc_success_hits,
+    COALESCE(sh.checkout_success_hits,0) checkout_success_hits,
+    coalesce(sh.plp_success_session, 0) as plp_success_session_flag,
+    coalesce(sh.pdp_success_session, 0)  as pdp_success_session_flag,
+    coalesce(sh.atc_success_session, 0)  as atc_success_session_flag,
+    coalesce(sh.checkout_success_session, 0)  as checkout_success_session_flag,
+    COALESCE(orders,0) orders,
+    COALESCE(order_units,0) order_units,
+    COALESCE(order_total_sales,0) order_total_sales,
+    COALESCE(ORDER_MERCH_SALES,0) order_merch_sales,
+    COALESCE(first_orders,0) first_orders,
+    COALESCE(first_order_units,0) first_order_units,
+    COALESCE(first_order_total_sales,0) first_order_total_sales,
+    COALESCE(first_order_merch_sales,0) first_order_merch_sales,
+    COALESCE(autoship_orders,0) autoship_orders,
+    COALESCE(autoship_order_units,0) autoship_order_units,
+    COALESCE(autoship_order_total_sales,0) autoship_order_total_sales,
+    COALESCE(autoship_order_merch_sales,0) autoship_order_merch_sales,
+    COALESCE(first_order_autoships,0) first_order_autoships,
+    COALESCE(first_order_autoship_units,0) first_order_autoship_units,
+    COALESCE(first_order_autoship_total_sales,0) first_order_autoship_total_sales,
+    COALESCE(first_order_autoship_merch_sales,0) first_order_autoship_merch_sales,
+    NULL home_page_session_flag,
+    NULL account_hits,
+    NULL account_session_flag,
+    NULL cart_hits,
+    NULL cart_session_flag,
+    NULL cart_success_hits,
+    NULL cart_success_session_flag,
+    NULL bot_type
+FROM
+    ecom_sandbox.tmp_sat_nma_exp_product_session_event_aggregate_v2 gh
+        LEFT JOIN
+    ecom_sandbox.tmp_sat_nma_exp_product_success_hits_final_v1 sh ON gh.derived_session_id = sh.derived_session_id
+;
+
+--------------------------------------------------------------
+---------------- Aggregate table for standard metrics in PAWs
+--------------------------------------------------------------
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sat_nma_exp_product_nma_metric_aggregate AS
+SELECT
+    variation,
+    session_date,
+    --data_provider,
+    dataset,
+    --session_id,
+    --customer_id,
+    --personalization_id,
+    --customer_session_id,
+    new_customer_flag,
+    active_autoship_flag,
+    tried_autoship_flag,
+    --recognized_session_flag,
+    --login_session_flag,
+    device_category,
+    channel_grouping,
+    channel,
+    MERCH_CLASSIFICATION1,
+    MERCH_CLASSIFICATION2,
+    --source,
+    --medium,
+    --campaign,
+    --referer,
+    --session_start_dttm,
+    --session_end_dttm,
+    --session_duration,
+    --NULL session_start_page,
+    --NULL session_start_page_type,
+    --NULL session_last_page,
+    --NULL session_last_page_type,
+    --NULL bounce_session,
+    --NULL plp_session_flag,
+    COUNT(DISTINCT SESSION_ID) AS TOTAL_SESSIONS,
+    --TOTAL_VISITORS NEED TO MATCH PAWS
+    COUNT(DISTINCT
+          CASE
+              WHEN PDP_SESSION_FLAG = 'True'
+              THEN SESSION_ID
+              END) PDP_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN ATC_SESSION_FLAG = 'True'
+              THEN SESSION_ID
+              END) ATC_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN ATA_SESSION_FLAG = 'True'
+              THEN SESSION_ID
+              END) ATA_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN CHECKOUT_SESSION_FLAG = 'True'
+              THEN SESSION_ID
+              END) CHECKOUT_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN PURCHASE_SESSION_FLAG = 'True'
+              THEN SESSION_ID
+              END) PURCHASE_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN PDP_SUCCESS_SESSION_FLAG = 'True'
+              THEN SESSION_ID
+              END) PDP_SUCCESS_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN ATC_SUCCESS_SESSION_FLAG = 'True'
+              THEN SESSION_ID
+              END) ATC_SUCCESS_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN CHECKOUT_SUCCESS_SESSION_FLAG = 'True'
+              THEN SESSION_ID
+              END) CHECKOUT_SUCCESS_SESSIONS,
+    SUM(ORDERS) ORDERS,
+    SUM(ORDER_UNITS) ORDER_UNITS,   
+    SUM(ORDER_TOTAL_SALES) ORDER_TOTAL_SALES,
+    SUM(ORDER_MERCH_SALES) ORDER_MERCH_SALES,
+    SUM(FIRST_ORDERS) FIRST_ORDERS,
+    SUM(FIRST_ORDER_UNITS) FIRST_ORDER_UNITS,
+    SUM(FIRST_ORDER_TOTAL_SALES) FIRST_ORDER_TOTAL_SALES,
+    SUM(FIRST_ORDER_MERCH_SALES) FIRST_ORDER_MERCH_SALES,    
+    SUM(AUTOSHIP_ORDERS) AUTOSHIP_ORDERS,   
+    SUM(AUTOSHIP_ORDER_UNITS) AUTOSHIP_ORDER_UNITS,    
+    SUM(AUTOSHIP_ORDER_TOTAL_SALES) AUTOSHIP_ORDER_TOTAL_SALES,    
+    SUM(AUTOSHIP_ORDER_MERCH_SALES) AUTOSHIP_ORDER_MERCH_SALES,    
+    SUM(FIRST_ORDER_AUTOSHIPS) FIRST_ORDER_AUTOSHIPS,    
+    SUM(FIRST_ORDER_AUTOSHIP_UNITS) FIRST_ORDER_AUTOSHIP_UNITS,     
+    SUM(FIRST_ORDER_AUTOSHIP_TOTAL_SALES) FIRST_ORDER_AUTOSHIP_TOTAL_SALES,   
+    SUM(FIRST_ORDER_AUTOSHIP_MERCH_SALES) FIRST_ORDER_AUTOSHIP_MERCH_SALES
+FROM
+    ecom_sandbox.tmp_sat_nma_exp_product_nma_session_aggregate_v1
+GROUP BY 
+1,2,3,4,5,6,7,8,9,10,11;
+
+------------------------------------------------------------------------------------------------------------------------------------
+---------------- Use the ecom_sandbox.tmp_sat_nma_exp_product_sessions_custom_table to define additional custom metrics. see examples below:
+------------------------------------------------------------------------------------------------------------------------------------
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sat_nma_exp_product_nma_custom_metrics AS
+SELECT
+    VARIATION,
+    MERCH_CLASSIFICATION1,
+    MERCH_CLASSIFICATION2,
+    COUNT(DISTINCT CASE WHEN event_category ilike '%pdp-reviews%' AND event_action ilike '%click%' AND event_label ilike '%word_cloud_chip%' THEN event_id END) WORD_CLOUDS_CLICKS,
+    COUNT(DISTINCT CASE WHEN event_category ilike '%pdp-reviews%' AND event_action ilike '%impression%' AND (event_label ilike '%word_cloud_chip%' or event_label ilike '%word-cloud%') THEN event_id END) AS WORD_CLOUDS_IMPRESSION
+FROM ecom_sandbox.tmp_sat_nma_exp_product_sessions_custom_table
+GROUP BY 1,2,3;
